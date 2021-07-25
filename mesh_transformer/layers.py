@@ -296,12 +296,13 @@ class TransformerLayerShard(hk.Module):
 
         return q, v, k
 
-    def __call__(self, x, attn_bias):
+    def __call__(self, x, attn_bias, v_cache, k_cache):
         x = f_psum(x)
         x = self.norm(x)
 
-        q, v, k = self.qvk_proj(x)
-
+        q, ret_v, ret_k = self.qvk_proj(x)
+        v = jnp.concatenate((v_cache, ret_v), axis=0)
+        k = jnp.concatenate((k_cache, ret_k), axis=0)
         seq_len = x.shape[0]
         causal_mask = np.tril(np.ones((seq_len, seq_len)))
         bias = -1e10 * (1. - causal_mask)
@@ -310,7 +311,7 @@ class TransformerLayerShard(hk.Module):
         attn_out = self.self_attn(q, v, k, bias)
         dense_out = self.ff(x)
 
-        return g_psum(attn_out + dense_out)
+        return g_psum(attn_out + dense_out), ret_v, ret_k
 
     # iterate the decoding process by a single token
     def decode_once(self, decode_state, x, attn_bias):
