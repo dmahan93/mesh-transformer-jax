@@ -93,7 +93,7 @@ if __name__ == "__main__":
                                       sample_size=params['seq'],
                                       restore_state=train_load_restore)
 
-    global_val_batch = per_replica_batch * tpu_size // cores_per_replica
+    global_val_batch = int(per_replica_batch * tpu_size // cores_per_replica * params.get("val_batch_multiplier", 1))
 
     val_sets = {}
 
@@ -103,7 +103,11 @@ if __name__ == "__main__":
                                         sample_size=seq)
 
     # use dynamic seq length unless pe is fixed
-    adaptor = EvalHarnessAdaptor(t, seq, global_val_batch * 4, shrink=pe != "fixed")
+    adaptor = EvalHarnessAdaptor(t,
+                                 seq,
+                                 global_val_batch,
+                                 shrink=pe != "fixed",
+                                 min_seq=1024 if args.version == 2 else None)  # work around suboptimal pjit layout
 
     start = time.time()
     t.train(train_dataset.get_samples())
@@ -114,9 +118,12 @@ if __name__ == "__main__":
         t.eval(val_set.get_samples())
     print(f"Eval fn compiled in {time.time() - start:.06}s")
 
-    wandb.init(project='mesh-transformer-jax', entity="eleutherai", name=params["name"], config=params)
+    project = params.get("wandb_project", "mesh-transformer-jax")
+    wandb.init(project=project, entity="eleutherai", name=params["name"], config=params)
 
     eval_task_dict = tasks.get_task_dict(eval_tasks)
+
+    pbar = tqdm(initial=step, total=total_steps, desc="Training progress")
 
     while True:
         loss, last_loss = t.train(train_dataset.get_samples())
@@ -131,9 +138,6 @@ if __name__ == "__main__":
             if step == total_steps:
                 print("training completed!")
                 exit()
-
-        if step % 100 == 0:
-            print(f"step {step} done")
 
         if step % val_every == 0:
             for name, val_set in val_sets.items():
@@ -160,3 +164,6 @@ if __name__ == "__main__":
             print(f"step {step} val results: {dumped}")
             wandb.log(flat_results, step)
         step += 1
+
+        pbar.set_postfix({'loss': loss, 'last_loss': last_loss})
+        pbar.update()

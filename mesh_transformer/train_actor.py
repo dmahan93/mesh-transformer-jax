@@ -22,10 +22,18 @@ class NetworkRunner(object):
         import haiku as hk
         # jax.experimental.maps.EXPERIMENTAL_SPMD_LOWERING = True
 
-        # thread_resources.env = ResourceEnv(Mesh(np.empty((), dtype=object), ()))
+        thread_resources.env = ResourceEnv(Mesh(np.empty((), dtype=object), ()), ())
 
         start = time.time()
-        # print(jax.devices())
+        jax.devices()
+
+        import warnings
+        warnings.filterwarnings("ignore")
+        warnings.filterwarnings("ignore", category=ResourceWarning)
+
+        if jax.host_id() == 0:
+            warnings.filterwarnings("default")
+
         head_print(f"jax devices: {jax.device_count()}")
         head_print(f"jax runtime initialized in {time.time() - start:.06}s")
         devices = np.array(jax.devices()).reshape(self.mesh_shape)

@@ -1,3 +1,4 @@
+import gc
 import random
 import time
 from functools import partial
@@ -13,7 +14,7 @@ from jax.experimental.pjit import pjit
 from mesh_transformer.checkpoint import read_ckpt, write_ckpt, write_ckpt_v2, load_ckpt_v2
 from mesh_transformer.layers import EmbeddingShard, TransformerLayerShard, RelativePositionEmbs, ProjectionShard, \
     TransformerLayerShardV2, Projection, EmbeddingShardV2
-from mesh_transformer.util import to_f32, to_bf16, maybe_shard, head_print
+from mesh_transformer.util import to_f32, to_bf16, maybe_shard, head_print, global_norm
 from jax.experimental import PartitionSpec as P
 
 
@@ -146,24 +147,29 @@ class CausalTransformer:
                 (loss, last_loss), grad = val_grad_fn(to_bf16(state["params"]), ctx, tgt)
 
                 new_grad = jax.tree_multimap(lambda a, b: a + b, old_grad, grad)
-                return new_grad, (loss, last_loss)
+                gnorm = global_norm(grad)
+                return new_grad, (loss, last_loss, gnorm)
 
             if ctx.shape[0] == 1:
                 val_grad_fn = jax.value_and_grad(train_loss_fn, has_aux=True)
                 (loss, last_loss), grad = val_grad_fn(to_bf16(state["params"]), ctx[0], tgt[0])
+                gnorm = global_norm(grad)
             else:
-                grad, (loss, last_loss) = jax.lax.scan(microbatch,
+                grad, (loss, last_loss, gnorm) = jax.lax.scan(microbatch,
                                                        jax.tree_map(lambda x: jnp.zeros_like(x).astype(jnp.bfloat16),
                                                                     state["params"]),
                                                        (ctx, tgt))
 
+            grad_norm_micro = jax.lax.pmean(gnorm, "batch")
+
             grad = jax.lax.pmean(grad, "batch")
+            grad_norm = global_norm(grad)
             updates, new_opt_state = optimizer.update(grad, state["opt_state"], state["params"])
 
-            return to_f32(loss), to_f32(last_loss), {
+            return to_f32(loss), to_f32(last_loss), to_f32(grad_norm), to_f32(grad_norm_micro), {
                 "params": optax.apply_updates(state["params"], to_f32(updates)),
                 "step": state["step"] + 1,
-                "opt_state": new_opt_state,
+                "opt_state": new_opt_state
             }
 
         def init(key, x):
@@ -193,10 +199,13 @@ class CausalTransformer:
                     next_token, decode_state, sample_key = carry
                     sample_key, new_key = jax.random.split(sample_key)
 
-                    output, new_state = transformer.generate_once(next_token, decode_state)
-                    next_token, sample_info = sampler(sample_key, output, sampler_input, **sampler_options)
+                    logits, new_state = transformer.generate_once(next_token, decode_state)
+                    next_token, sample_info = sampler(sample_key, logits, sampler_input, **sampler_options)
 
-                    output = (next_token, sample_info)
+                    if self.return_logits:
+                        output = (next_token, sample_info, logits)
+                    else:
+                        output = (next_token, sample_info)
                     new_carry = (next_token, new_state, new_key)
                     return new_carry, output
 
@@ -224,7 +233,7 @@ class CausalTransformer:
                                                      in_axes=(["shard", ...],
                                                               ["batch", ...],
                                                               ["batch", ...]),
-                                                     out_axes=(["batch", ...], ["batch", ...], ["shard", ...]),
+                                                     out_axes=(["batch", ...], ["batch", ...], ["batch", ...], ["batch", ...], ["shard", ...]),
                                                      donate_argnums=(0,),
                                                      axis_resources={'shard': 'mp', 'batch': 'dp'})
 
@@ -289,11 +298,12 @@ class CausalTransformer:
         # assert (sample["obs"][:, 1:] == sample["target"][:, -1])
 
         # start = time.time()
-        loss, last_loss, self.state = self.train_xmap(self.state, obs, target)
+        loss, last_loss, grad_norm, grad_norm_micro, self.state = self.train_xmap(self.state, obs, target)
         loss = np.array(loss)
         last_loss = np.array(last_loss)
+        grad_norm = np.array(grad_norm)
         # print(f"iter done in {time.time() - start:.06}s")
-        return loss.mean(), last_loss.mean()
+        return loss.mean(), last_loss.mean(), grad_norm.mean(), grad_norm_micro.mean()
 
     def eval(self, sample):
         # print("eval sample", sample["obs"].shape)
@@ -313,12 +323,13 @@ class CausalTransformer:
         # print(f"eval done in {time.time() - start:.06}s")
         return out
 
-    def generate(self, ctx, ctx_length, gen_length, sampler_options):
+    def generate(self, ctx, ctx_length, gen_length, sampler_options, return_logits=False):
         key = hk.PRNGSequence(random.randint(0, 2 ** 60))
 
         batch_size = ctx.shape[0]
         aux = jnp.zeros((batch_size, gen_length), dtype=jnp.uint32)
         self.gen_length = gen_length
+        self.return_logits = return_logits
 
         return self.generate_xmap(self.state,
                                   jnp.array(key.take(batch_size)),
@@ -334,6 +345,13 @@ class CausalTransformerV2:
     def __init__(self, config):
         self.config = config
         optimizer = config["optimizer"]
+        with_optimizer = optimizer is not None
+
+        head_print(f"with_optimizer: {with_optimizer}")
+
+        bf16_optimizer = config.get("bf16_optimizer", False)
+        early_cast = config.get("early_cast", False)
+        early_collect = config.get("early_collect", True)
 
         def embedding(x):
             x = maybe_shard(x, P("dp", None))
@@ -343,8 +361,20 @@ class CausalTransformerV2:
             out = x + TransformerLayerShardV2(config, init_scale=2. / config["layers"])(x, mask)
             return maybe_shard(out, P("dp", None, "mp"))
 
+        def init_decode(x, given_length, mask):
+            residual, decode_state = TransformerLayerShardV2(config, init_scale=2. / config["layers"])\
+                .get_init_decode_state(x, given_length, mask)
+            out = x + residual
+            return maybe_shard(out, P("dp", None, "mp")), decode_state
+
+        def iter_decode(decode_state, x):
+            residual, decode_state = TransformerLayerShardV2(config, init_scale=2. / config["layers"])\
+                .decode_once(decode_state, x, 0)
+            out = x + residual
+            return maybe_shard(out, P("dp", None, "mp")), decode_state
+
         def transformer(x, mask):
-            return hk.remat(residual)(x, mask)
+            return hk.remat(residual, prevent_cse=False)(x, mask)
 
         def projection(x):
             return Projection(config)(x)
@@ -357,8 +387,10 @@ class CausalTransformerV2:
             return embed_init_fn, transformer_init_fn, projection_init_fn
 
         def shard_strategy(shape_dtype, parallel):
-            if shape_dtype.ndim <= 1:
+            if shape_dtype.ndim == 0:
                 return P()
+            if shape_dtype.ndim == 1:
+                return P(None)
             # embedding/projection layers
             elif shape_dtype.shape == (config["n_vocab"], config["d_model"]):
                 return P(parallel, None)
@@ -370,7 +402,7 @@ class CausalTransformerV2:
                 if shape_dtype.ndim == 2:
                     # a channel wise variable (e.g. layernorm parameters)
                     # replicate it for speed
-                    return P(None)
+                    return P(None, None)
                 elif shape_dtype.ndim == 3:
                     # a weight matrix
                     matrix_size = shape_dtype.shape[1:]
@@ -408,11 +440,15 @@ class CausalTransformerV2:
                 "proj": projection_init_fn(p_key, jax.random.uniform(t_key, input_shape[1:], dtype=jnp.float32)),
             }
 
-            return {
-                "params": ("early_cast" in config and to_bf16 or to_f32)(params),
+            output_state = {
+                "params": (to_bf16 if early_cast else to_f32)(params),
                 "step": np.array(0),
-                "opt_state": optimizer.init(params)
             }
+
+            if with_optimizer:
+                output_state["opt_state"] = optimizer.init((to_bf16 if bf16_optimizer else to_f32)(params))
+
+            return output_state
 
         assert thread_resources.env.shape['mp'] == config["cores_per_replica"]
 
@@ -429,14 +465,19 @@ class CausalTransformerV2:
         state_shard = {
                 "step": P(),
 
-                # zero level 1: shard optimizer states over both MP and DP
-                "opt_state": jax.tree_map(partial(shard_strategy, parallel=["mp", "dp"]), param_shapes["opt_state"]),
-
                 # fp32 params are also sharded (so this is like a weird mix between zero-1 and zero-3...)
                 "params": jax.tree_map(partial(shard_strategy, parallel=["mp", "dp"]), param_shapes["params"]),
             }
 
+        if "opt_state" in param_shapes:
+            # zero level 1: shard optimizer states over both MP and DP
+            state_shard["opt_state"] = jax.tree_map(partial(shard_strategy, parallel=["mp", "dp"]), param_shapes["opt_state"])
+
+        self.state_shard = state_shard
+
         head_print("sharding strategy:")
+        # head_print("state shard: ", state_shard)
+        # head_print("param_shapes: ", param_shapes)
         jax.tree_multimap(head_print, state_shard, param_shapes)
 
         self.init_pjit = pjit(init, in_axis_resources=(None, P("dp")), out_axis_resources=state_shard)
@@ -468,13 +509,13 @@ class CausalTransformerV2:
 
             return projection_apply_fn(params["proj"], x, y)
 
+        mp_shard_strategy = jax.tree_map(partial(shard_strategy, parallel=["mp"]), param_shapes["params"])
+
         def train(state, ctx, tgt):
-            ctx = jnp.transpose(ctx, (1, 0, 2))
-            tgt = jnp.transpose(tgt, (1, 0, 2))
-
-            param_shard_startegy = jax.tree_map(partial(shard_strategy, parallel=["mp"]), param_shapes["params"])
-
-            bf16_params = maybe_shard(to_bf16(state["params"]), param_shard_startegy)
+            if early_collect:
+                bf16_params = maybe_shard(to_bf16(state["params"]), mp_shard_strategy)
+            else:
+                bf16_params = to_bf16(state["params"])
 
             def microbatch(old_grad, batch):
                 ctx, tgt = batch
@@ -503,12 +544,17 @@ class CausalTransformerV2:
             }
 
         self.train_pjit = pjit(train,
-                               in_axis_resources=(state_shard, P("dp"), P("dp")),
+                               in_axis_resources=(state_shard, P(None, "dp"), P(None, "dp")),
                                out_axis_resources=(None, None, state_shard),
                                donate_argnums=(0,))
 
         def eval_apply_fn(params, x, y, mask):
             embed_apply_fn, transformer_apply_fn = apply_fns()
+
+            if early_collect:
+                bf16_params = maybe_shard(to_bf16(params), mp_shard_strategy)
+            else:
+                bf16_params = to_bf16(params)
 
             def eval_loss(x, y):
                 loss, correct = Projection(config).loss(x, y)
@@ -521,7 +567,7 @@ class CausalTransformerV2:
 
             projection_apply_fn = hk.without_apply_rng(hk.transform(eval_loss)).apply
 
-            x = embed_apply_fn(params["embed"], x)
+            x = embed_apply_fn(bf16_params["embed"], x)
 
             def apply_scan_fn(layer_in, layer_state):
                 x, mask = layer_in
@@ -529,22 +575,83 @@ class CausalTransformerV2:
 
             x = jax.lax.scan(apply_scan_fn,
                              (to_bf16(x), mask),
-                             xs=params["transformer"])[0][0]
+                             xs=bf16_params["transformer"])[0][0]
 
-            return projection_apply_fn(params["proj"], x, y)
+            return projection_apply_fn(bf16_params["proj"], x, y)
 
-        def eval(state, ctx, tgt, ctx_length):
+        def eval(params, ctx, tgt, ctx_length):
             mask = (jnp.arange(0, ctx.shape[1])[None, :] > ctx_length[:, None]) * -1e10
 
             # head_print("mask.shape", mask.shape)
             # head_print("ctx.shape", ctx.shape)
             # head_print("ctx_length.shape", ctx_length.shape)
 
-            return eval_apply_fn(to_bf16(state["params"]), ctx, tgt, mask[:, None, None, :])
+            return eval_apply_fn(params, ctx, tgt, mask[:, None, None, :])
 
         self.eval_pjit = pjit(eval,
-                              in_axis_resources=(state_shard, P("dp"), P("dp"), P("dp")),
+                              in_axis_resources=(mp_shard_strategy if early_collect else state_shard["params"],
+                                                 P("dp"), P("dp"), P("dp")),
                               out_axis_resources=P("dp"))
+
+        def generate(params, key, ctx, ctx_length, aux, sampler_options):
+            sampler = config["sampler"]
+            gen_length = config["gen_length"]
+
+            embed_apply_fn, _ = apply_fns()
+            init_decode_apply = hk.without_apply_rng(hk.transform(init_decode)).apply
+            iter_decode_apply = hk.without_apply_rng(hk.transform(iter_decode)).apply
+
+            def get_inital(params, ctx, ctx_length):
+                x = embed_apply_fn(params["embed"], ctx)
+                mask = (jnp.arange(0, ctx.shape[1])[None, :] > ctx_length[:, None]) * -1e10
+
+                def apply_scan_fn(layer_in, layer_state):
+                    x, mask = layer_in
+
+                    x, decode_state = init_decode_apply(layer_state, x, mask)
+                    return (x, mask), decode_state
+
+                _, init_state = jax.lax.scan(apply_scan_fn,
+                                 (to_bf16(x), mask),
+                                 xs=params["transformer"])
+
+                return (last.astype(jnp.uint32), init_state, hk.next_rng_key())
+
+            initial_state = get_inital(params, ctx, ctx_length)
+            initial_carry = ()
+
+            def generate_scan_fn(carry, sampler_input):
+                next_token, decode_state, sample_key = carry
+                sample_key, new_key = jax.random.split(sample_key)
+
+                x = embed_apply_fn(params["embed"], next_token)
+                mask = (jnp.arange(0, ctx.shape[1])[None, :] > ctx_length[:, None]) * -1e10
+
+                def layer_scan_fn(carry_in, layer_in):
+                    x, mask = carry_in
+                    layer_state, decode_state = layer_in
+
+                    x, decode_state = iter_decode_apply(layer_state, decode_state, x)
+                    return (x, mask), decode_state
+
+                (x, _), new_state = jax.lax.scan(layer_scan_fn,
+                                             (to_bf16(x), mask),
+                                             xs=params["transformer"])
+
+                projection_apply_fn = hk.without_apply_rng(hk.transform(Projection(config))).apply
+
+                logits = projection_apply_fn(params["proj"], x)
+                next_token, sample_info = sampler(sample_key, logits, sampler_input, **sampler_options)
+
+                new_carry = (next_token, new_state, new_key)
+                return new_carry, (next_token, sample_info)
+
+            final_state, outputs = jax.lax.scan(generate_scan_fn, initial_state, xs=aux, length=gen_length)
+            return final_state, outputs
+
+        self.move_weights_pjit = pjit(lambda x: to_bf16(x),
+                                      in_axis_resources=(state_shard["params"], ),
+                                      out_axis_resources=mp_shard_strategy if early_collect else state_shard["params"])
 
         seq = config["seq"]
         vocab = config["n_vocab"]
@@ -558,6 +665,12 @@ class CausalTransformerV2:
         head_print("mp", mp)
 
         self.state = self.init_pjit(next(key), x)
+        self.state_shard = state_shard
+
+        if with_optimizer:
+            self.eval_weights = None
+        else:
+            self.eval_weights = self.state["params"]
 
         param_count = hk.data_structures.tree_size(self.state['params'])
         head_print(f"Total parameters: {param_count * dp}")
@@ -566,18 +679,20 @@ class CausalTransformerV2:
         write_ckpt_v2(self.state, path)
 
     def load_ckpt(self, path):
-        self.state = load_ckpt_v2(self.state, path)
+        self.state = load_ckpt_v2(self.state, path, self.state_shard, not self.config.get("eval_only", False))
 
     def train(self, sample):
         # print("train iter")
         # print("sample", sample["obs"])
         # print("target", sample["target"])
 
-        # obs = sample["obs"]
-        # target = sample["target"]
+        obs = sample["obs"]
+        target = sample["target"]
 
-        obs = jnp.transpose(sample["obs"], (1, 0, 2))
-        target = jnp.transpose(sample["target"], (1, 0, 2))
+        if self.eval_weights is not None:
+            self.eval_weights = None
+            gc.collect()
+            head_print("deleted eval weights")
 
         # print("train sample", obs.shape)
         # print("train target", target.shape)
@@ -589,14 +704,22 @@ class CausalTransformerV2:
         loss = np.array(loss)
         last_loss = np.array(last_loss)
 
-        # print(f"iter done in {time.time() - start:.06}s")
+        # head_print(f"iter done in {time.time() - start:.06}s")
         return loss.mean(), last_loss.mean()
 
     def eval(self, sample):
-        # print("eval sample", sample["obs"].shape)
+        # head_print("eval sample", sample["obs"].shape)
         # print("eval target", sample["target"].shape)
 
-        # start = time.time()
+        start = time.time()
+
+        if self.eval_weights is None:
+            self.eval_weights = self.move_weights_pjit(self.state["params"])
+
+            # blocking
+            jnp.zeros(()).block_until_ready()
+
+            head_print(f"created eval weights in {time.time() - start:.06}s")
 
         if "ctx_length" in sample:
             ctx_length = sample["ctx_length"]
@@ -605,7 +728,7 @@ class CausalTransformerV2:
 
         # head_print("ctx_length in eval", ctx_length)
 
-        out = self.eval_pjit(self.state, sample["obs"], sample["target"], ctx_length)
+        out = self.eval_pjit(self.eval_weights, sample["obs"], sample["target"], ctx_length)
         # print(f"eval dispatched in {time.time() - start:.06}s")
 
         # np.array(out["loss"])
